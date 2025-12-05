@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Application 6: OceanSense Project</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f4f4f9; }
+        header { text-align: center; border-bottom: 2px solid #0077cc; padding-bottom: 20px; margin-bottom: 20px; }
+        h1 { color: #004466; margin-bottom: 5px; }
+        .subtitle { color: #666; font-style: italic; }
+        .section { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .video-container { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; max-width: 100%; border-radius: 8px; }
+        .video-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 5px; overflow-x: auto; max-height: 500px; overflow-y: scroll; font-size: 14px; }
+        code { font-family: 'Courier New', Courier, monospace; }
+        .footer { text-align: center; font-size: 0.8em; color: #888; margin-top: 40px; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>OceanSense RTOS Firmware</h1>
+        <p class="subtitle">Application 6 Assignment | By Andre Llanos</p>
+    </header>
+
+    <div class="section">
+        <h2>About the Project</h2>
+        <p>
+            <strong>OceanSense</strong> is a proof-of-concept for an autonomous buoy system designed to monitor ocean conditions in real-time. 
+            Built using the <strong>ESP32 microcontroller</strong> and <strong>FreeRTOS</strong> (Real-Time Operating System), this firmware manages multiple sensors simultaneously without lag.
+        </p>
+        <p>Key features include:</p>
+        <ul>
+            <li><strong>Wave Energy Monitoring:</strong> Uses an accelerometer (MPU6050) to calculate wave intensity.</li>
+            <li><strong>Environmental Sensing:</strong> Simulation of salinity sensors via ADC readings.</li>
+            <li><strong>Collision Avoidance:</strong> A "Radar" task using ultrasonic sensors to detect hazards within 50cm.</li>
+            <li><strong>Telemetry:</strong> A communication task that logs data and system health in real-time.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>Project Demo</h2>
+        <p>Watch a short demonstration of the firmware in action:</p>
+        <div class="video-container">
+            <iframe width="560" height="315" 
+                src="https://www.youtube.com/embed/REPLACEME" 
+                title="YouTube video player" frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen>
+            </iframe>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Firmware Source Code</h2>
+        <p>Below is the C implementation for the ESP-IDF framework:</p>
+<pre><code>/*
+ * OceanSense RTOS Firmware (ESP-IDF Version)
+ * Context: Autonomous Buoy Proof of Concept
+ * Author: Andre Llanos
+ * - Built on FreeRTOS (Native to ESP-IDF)
+ */
+
+#include &lt;stdio.h&gt;
+#include &lt;math.h&gt;
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "driver/adc.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "rom/ets_sys.h" 
+
+// --- PIN DEFINITIONS ---
+#define PIN_TRIG      5
+#define PIN_ECHO      18
+#define PIN_LED_HAZ   19
+#define PIN_LED_STAT  2
+#define PIN_BTN_MODE  12
+#define ADC_CHANNEL   ADC1_CHANNEL_6 
+
+// --- I2C CONFIG (MPU6050) ---
+#define I2C_MASTER_SCL_IO 22
+#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_NUM    0
+#define MPU6050_ADDR      0x68
+#define MPU6050_PWR_MGMT  0x6B
+#define MPU6050_ACCEL_X   0x3B
+
+// --- RTOS HANDLES ---
+static QueueHandle_t sensorQueue;
+static SemaphoreHandle_t modeSemaphore;
+static SemaphoreHandle_t printMutex;
+
+typedef struct {
+    float salinity;
+    float waveEnergy;
+    bool hazard;
+    int64_t timestamp;
+} telemetry_t;
+
+static bool maintenanceMode = false;
+
+// Initialize I2C and wake up MPU6050
+void mpu6050_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_PWR_MGMT, true);
+    i2c_master_write_byte(cmd, 0x00, true); // Wake up
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+}
+
+// Read raw Acceleration X 
+int16_t mpu6050_read_accel_x() {
+    uint8_t data[2];
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_ACCEL_X, true);
+    i2c_master_start(cmd); 
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, data, 2, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    
+    return (int16_t)(data[0] << 8 | data[1]);
+}
+
+static void IRAM_ATTR gpio_isr_handler(void* arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(modeSemaphore, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+// TASK: RADAR (Hard Real-Time)
+void radar_task(void *pvParameters) {
+    gpio_set_direction(PIN_TRIG, GPIO_MODE_OUTPUT);
+    gpio_set_direction(PIN_ECHO, GPIO_MODE_INPUT);
+    gpio_set_direction(PIN_LED_HAZ, GPIO_MODE_OUTPUT);
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(50); 
+
+    while (1) {
+        gpio_set_level(PIN_TRIG, 0);
+        ets_delay_us(2);
+        gpio_set_level(PIN_TRIG, 1);
+        ets_delay_us(10);
+        gpio_set_level(PIN_TRIG, 0);
+
+        int64_t start = esp_timer_get_time();
+        while(gpio_get_level(PIN_ECHO) == 0 && (esp_timer_get_time() - start) < 10000);
+        
+        int64_t pulse_start = esp_timer_get_time();
+        while(gpio_get_level(PIN_ECHO) == 1 && (esp_timer_get_time() - pulse_start) < 25000); 
+        int64_t pulse_end = esp_timer_get_time();
+
+        float distance = (pulse_end - pulse_start) / 58.0f;
+
+        if (distance > 0 && distance < 50) {
+            gpio_set_level(PIN_LED_HAZ, 1);
+        } else {
+            gpio_set_level(PIN_LED_HAZ, 0);
+        }
+
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+// TASK: WAVE PROCESSING (Variable Load)
+void wave_task(void *pvParameters) {
+    mpu6050_init();
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(200);
+
+    while(1) {
+        int16_t raw_accel = mpu6050_read_accel_x();
+        float magnitude = abs(raw_accel) / 1000.0f; 
+        int loops = (magnitude > 2.0f) ? 5000 : 500; 
+        float energy = 0;
+        
+        for(int i=0; i&lt;loops; i++) {
+            energy += sqrt(i) * 0.01; 
+        }
+
+        telemetry_t data;
+        data.waveEnergy = energy;
+        data.salinity = adc1_get_raw(ADC_CHANNEL) * (14.0 / 4095.0);
+        data.hazard = false; 
+        data.timestamp = esp_timer_get_time() / 1000;
+
+        xQueueSend(sensorQueue, &data, pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+// TASK: TELEMETRY (Soft Real-Time)
+void telemetry_task(void *pvParameters) {
+    telemetry_t recv;
+    static int64_t last_timestamp = 0; 
+
+    while(1) {
+        if (xSemaphoreTake(modeSemaphore, 0) == pdTRUE) {
+            maintenanceMode = !maintenanceMode;
+            xSemaphoreTake(printMutex, portMAX_DELAY);
+            printf("--- MODE CHANGED: %s ---\n", maintenanceMode ? "MAINTENANCE" : "NORMAL");
+            xSemaphoreGive(printMutex);
+        }
+
+        if (xQueueReceive(sensorQueue, &recv, pdMS_TO_TICKS(100))) {
+            int64_t delta_time = recv.timestamp - last_timestamp;
+            last_timestamp = recv.timestamp; 
+
+            xSemaphoreTake(printMutex, portMAX_DELAY);
+            if (maintenanceMode) {
+                printf("[VERBOSE] Delta: %lld ms | pH: %.2f | Energy: %.2f\n", delta_time, recv.salinity, recv.waveEnergy);
+            } else {
+                printf("%lld,%.2f,%.2f\n", delta_time, recv.salinity, recv.waveEnergy);
+            }
+            xSemaphoreGive(printMutex);
+        }
+    }
+}
+
+void heartbeat_task(void *pvParameters) {
+    gpio_set_direction(PIN_LED_STAT, GPIO_MODE_OUTPUT);
+    while(1) {
+        gpio_set_level(PIN_LED_STAT, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(PIN_LED_STAT, 0);
+        vTaskDelay(pdMS_TO_TICKS(900));
+    }
+}
+
+void app_main() {
+    sensorQueue = xQueueCreate(10, sizeof(telemetry_t));
+    modeSemaphore = xSemaphoreCreateBinary();
+    printMutex = xSemaphoreCreateMutex();
+
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .pin_bit_mask = (1ULL << PIN_BTN_MODE),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = 1
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_BTN_MODE, gpio_isr_handler, NULL);
+
+    xTaskCreate(radar_task, "Radar", 4096, NULL, 5, NULL); 
+    xTaskCreate(wave_task, "Wave", 4096, NULL, 3, NULL); 
+    xTaskCreate(telemetry_task, "Comms", 4096, NULL, 2, NULL);
+    xTaskCreate(heartbeat_task, "Beat", 2048, NULL, 1, NULL);
+
+    printf("OceanSense System Started...\n");
+}
+</code></pre>
+    </div>
+
+    <div class="footer">
+        <p>Hosted on GitHub Pages</p>
+    </div>
+
+</body>
+</html>
